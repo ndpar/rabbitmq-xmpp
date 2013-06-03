@@ -253,7 +253,7 @@ do_route(From, To, {xmlelement, "message", _, _} = Packet) ->
                                                [{'content_type', <<"text/plain">>}],
                                                list_to_binary(Body)]),
                             Delivery = rabbit_call(rabbit_basic, delivery,
-                                                   [false, false, none, Msg]),
+                                                   [false, Msg, undefined]),
                             rabbit_call(rabbit_basic, publish, [Delivery])
 		    end
 	    end
@@ -421,8 +421,8 @@ do_unsub(QJID, XJID, XNameBin, RKBin, QNameBin) ->
 get_bound_queues(XNameBin) ->
     XName = ?XNAME(XNameBin),
     [{QNameBin, RKBin} ||
-	#binding{queue_name = #resource{name = QNameBin}, key = RKBin} <-
-            rabbit_call(rabbit_binding, list_for_exchange, [XName])].
+	#binding{destination = #resource{name = QNameBin}, key = RKBin} <-
+            rabbit_call(rabbit_binding, list_for_source, [XName])].
 
 unsub_all(XNameBin, ExchangeJID) ->
     {atomic, BindingDescriptions} =
@@ -466,11 +466,11 @@ send_message(From, To, TypeStr, BodyStr) ->
     ejabberd_router:route(From, To, XmlBody).
 
 rabbit_exchange_list_queue_bindings(QN) ->
-    rabbit_call(rabbit_binding, list_for_queue, [QN]).
+    rabbit_call(rabbit_binding, list_for_destination, [QN]).
 
 is_subscribed(XNameBin, RKBin, QNameBin) ->
     XName = ?XNAME(XNameBin),
-    lists:any(fun (#binding{exchange_name = N, key = R})
+    lists:any(fun (#binding{source = N, key = R})
                     when N == XName andalso R == RKBin ->
 		      true;
 		  (_) ->
@@ -482,11 +482,11 @@ check_and_bind(XNameBin, RKBin, QNameBin) ->
     case rabbit_exchange_lookup(?XNAME(XNameBin)) of
 	{ok, _X} ->
 	    ?DEBUG("... exists", []),
-	    #amqqueue{} = rabbit_call(rabbit_amqqueue, declare,
+        {_, #amqqueue{}} = rabbit_call(rabbit_amqqueue, declare,
                                       [?QNAME(QNameBin), true, false, [], none]),
 	    ok = rabbit_call(rabbit_binding, add,
-                             [#binding{exchange_name = ?XNAME(XNameBin),
-                                       queue_name    = ?QNAME(QNameBin),
+                             [#binding{source        = ?XNAME(XNameBin),
+                                       destination   = ?QNAME(QNameBin),
                                        key           = RKBin,
                                        args          = []}]),
 	    true;
@@ -500,8 +500,8 @@ unbind_and_delete(XNameBin, RKBin, QNameBin) ->
     XName = ?XNAME(XNameBin),
     QName = ?QNAME(QNameBin),
     case rabbit_call(rabbit_binding, remove,
-                     [#binding{exchange_name = XName,
-                               queue_name    = QName,
+                     [#binding{source        = XName,
+                               destination   = QName,
                                key           = RKBin,
                                args          = []}]) of
 	{error, _Reason} ->
@@ -565,7 +565,7 @@ probe_queues(Server, [#amqqueue{name = QName = #resource{name = QNameBin}} | Res
 probe_bindings(_Server, _JID, []) ->
     ok;
 probe_bindings(Server, JID,
-               [#binding{exchange_name = #resource{name = XNameBin}} | Rest]) ->
+               [#binding{source = #resource{name = XNameBin}} | Rest]) ->
     ?DEBUG("**** Probing ~p ~p ~p", [JID, XNameBin, Server]),
     SourceJID = jlib:make_jid(binary_to_list(XNameBin), Server, ""),
     send_presence(SourceJID, JID, "probe"),
@@ -615,11 +615,12 @@ consumer_init(QNameBin, JID, RKBin, Server, Priority) ->
     ?INFO_MSG("**** starting consumer for queue ~p~njid ~p~npriority ~p rkbin ~p",
 	      [QNameBin, JID, Priority, RKBin]),
     ok = contact_rabbitmq(),
-    ConsumerTag = rabbit_call(rabbit_guid, binstring_guid, ["amq.xmpp"]),
+    GUID = binary_to_list(rabbit_call(rabbit_guid, gen, [])),
+    ConsumerTag = rabbit_call(rabbit_guid, binary, [GUID, "amq.xmpp"]),
     with_queue(?QNAME(QNameBin),
                fun(Q) ->
                        rabbit_call(rabbit_amqqueue, basic_consume,
-                                   [Q, true, self(), undefined, ConsumerTag, false, undefined])
+                                   [Q, true, self(), undefined, false, ConsumerTag, false, none, undefined])
                end),
     ?MODULE:consumer_main(#consumer_state{lserver = Server,
 					  consumer_tag = ConsumerTag,
@@ -668,7 +669,7 @@ consumer_main(#consumer_state{priorities = Priorities} = State) ->
 	    ?MODULE:consumer_main(State#consumer_state{priorities = NewPriorities});
 	{'$gen_cast', {deliver, _ConsumerTag, false, {_QName, QPid, _Id, _Redelivered, Msg}}} ->
 	    #basic_message{exchange_name = #resource{name = XNameBin},
-			   routing_key = RKBin,
+			   routing_keys = [RKBin],
 			   content = #content{payload_fragments_rev = PayloadRev}} = Msg,
 	    [{_, {TopPriorityJID, _}} | _] = Priorities,
 	    send_message(jlib:make_jid(binary_to_list(XNameBin),
